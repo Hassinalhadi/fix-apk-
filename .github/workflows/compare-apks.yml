@@ -70,11 +70,27 @@ jobs:
           diff -u out/apk1/apktool.yml out/apk2/apktool.yml > report/apktool_yml_diff.txt || true
           diff -rq out/apk1 out/apk2 > report/file_tree_diff.txt || true
 
-          # Compare all smali directories
           mkdir -p out/smali1 out/smali2
           cp -r out/apk1/smali* out/smali1/ 2>/dev/null || true
           cp -r out/apk2/smali* out/smali2/ 2>/dev/null || true
           diff -ru out/smali1 out/smali2 > report/smali_diff.txt || true
+
+      - name: Search & Extract Play Integrity and AutoBid Smali from LocateGO2.apk
+        run: |
+          mkdir -p report/extracted_smali
+
+          {
+            echo "=== Matching Smali Filenames (AutoBid / Integrity) ==="
+            find out/apk2/smali* -type f \( -iname "*autobid*" -o -iname "*integrity*" \) | sort || true
+            echo ""
+            echo "=== Grep Matches in LocateGO2.apk Smali ==="
+            grep -rniE "IntegrityManager|StandardIntegrityManager|PlayIntegrity|requestIntegrityToken|UNRECOGNIZED_VERSION|Device integrity|autobid" out/apk2/smali* || true
+          } > report/integrity_autobid_matches.txt
+
+          # Copy all AutoBid smali files and any smali files mentioning Play Integrity / integrity verification
+          find out/apk2/smali* -type f -path "*autobid*" -exec cp --parents {} report/extracted_smali/ \; 2>/dev/null || true
+          grep -rlE "IntegrityManager|StandardIntegrityManager|PlayIntegrity|requestIntegrityToken|UNRECOGNIZED_VERSION|Device integrity" out/apk2/smali* 2>/dev/null | \
+            xargs -r -I{} cp --parents "{}" report/extracted_smali/ || true
 
       - name: Publish Comparison Summary
         run: |
@@ -91,9 +107,9 @@ jobs:
             head -n 120 report/manifest_diff.txt
             echo '```'
             echo ""
-            echo "### 3. Changed Files Summary (first 100 lines)"
+            echo "### 3. Play Integrity & AutoBid Matches in LocateGO2.apk (first 100 lines)"
             echo '```text'
-            head -n 100 report/file_tree_diff.txt
+            head -n 100 report/integrity_autobid_matches.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
