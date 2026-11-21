@@ -25,22 +25,34 @@ jobs:
         run: |
           java -jar apktool.jar d LocateGO2.apk -o decoded -f
 
-      - name: Compile HttpLogInterceptor to Smali
+      - name: Compile HttpLogInterceptor to DEX
         run: |
           ANDROID_JAR=$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar | sort -V | tail -n 1)
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
           echo "Using android.jar: $ANDROID_JAR"
           echo "Using build-tools: $BUILD_TOOLS"
 
-          mkdir -p log_src/okhttp3 log_src/okio log_src/com/locatego/log log_classes log_dex log_smali
+          mkdir -p log_src/okhttp3 log_src/okio log_src/com/locatego/log log_classes log_dex
 
-          # Minimal compile-time stubs matching LocateGO2's OkHttp3 & Okio signatures
+          # Exact compile-time stubs matching LocateGO2's OkHttp3 & Okio signatures
+          cat <<'EOF' > log_src/okio/BufferedSink.java
+          package okio;
+          public interface BufferedSink {}
+          EOF
+
           cat <<'EOF' > log_src/okio/Buffer.java
           package okio;
-          public class Buffer {
+          public class Buffer implements BufferedSink {
               public Buffer() {}
               public long size() { return 0; }
               public String readUtf8() { return ""; }
+          }
+          EOF
+
+          cat <<'EOF' > log_src/okhttp3/HttpUrl.java
+          package okhttp3;
+          public class HttpUrl {
+              public String toString() { return ""; }
           }
           EOF
 
@@ -54,8 +66,9 @@ jobs:
           cat <<'EOF' > log_src/okhttp3/RequestBody.java
           package okhttp3;
           import java.io.IOException;
+          import okio.BufferedSink;
           public abstract class RequestBody {
-              public void writeTo(Object sink) throws IOException {}
+              public void writeTo(BufferedSink sink) throws IOException {}
           }
           EOF
 
@@ -63,7 +76,7 @@ jobs:
           package okhttp3;
           public class Request {
               public String method() { return ""; }
-              public Object url() { return null; }
+              public HttpUrl url() { return null; }
               public Headers headers() { return null; }
               public RequestBody body() { return null; }
           }
@@ -242,16 +255,8 @@ jobs:
           javac -source 1.8 -target 1.8 -cp "$ANDROID_JAR" -d log_classes \
             log_src/okio/*.java log_src/okhttp3/*.java log_src/com/locatego/log/*.java
 
-          "$BUILD_TOOLS/d8" --output log_dex log_classes/com/locatego/log/*.class
-
-          if java -cp apktool.jar com.android.tools.smali.baksmali.Main --help >/dev/null 2>&1; then
-            java -cp apktool.jar com.android.tools.smali.baksmali.Main d log_dex/classes.dex -o log_smali
-          else
-            java -cp apktool.jar org.jf.baksmali.Main d log_dex/classes.dex -o log_smali
-          fi
-
-          mkdir -p decoded/smali/com/locatego/log
-          cp -r log_smali/com/locatego/log/* decoded/smali/com/locatego/log/
+          "$BUILD_TOOLS/d8" --classpath "$ANDROID_JAR" --classpath log_classes \
+            --output log_dex log_classes/com/locatego/log/*.class
 
       - name: Hook OkHttpClient$Builder and Enable Network Logging Config
         run: |
@@ -315,9 +320,23 @@ jobs:
           print("Updated AndroidManifest.xml")
           EOF
 
-      - name: Rebuild, Zipalign and Sign APK
+      - name: Rebuild, Inject Log DEX, Zipalign and Sign APK
         run: |
           java -jar apktool.jar b decoded -o LocateGO2-unaligned.apk
+
+          python3 - <<'EOF'
+          import re, zipfile
+
+          with zipfile.ZipFile("LocateGO2-unaligned.apk", "a") as z:
+              dex_nums = [1]
+              for n in z.namelist():
+                  m = re.match(r'^classes(\d*)\.dex$', n)
+                  if m:
+                      dex_nums.append(int(m.group(1) or 1))
+              next_dex = f"classes{max(dex_nums) + 1}.dex"
+              z.write("log_dex/classes.dex", next_dex)
+              print(f"Injected HttpLogInterceptor DEX as {next_dex}")
+          EOF
 
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
           echo "Using build-tools: $BUILD_TOOLS"
