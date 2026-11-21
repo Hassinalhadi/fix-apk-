@@ -1,0 +1,190 @@
+name: Convert Repo to Open Source & Extract APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      extract_mode:
+        description: "Extraction mode (raw bytes + decoded resources, or raw bytes only)"
+        required: true
+        default: "raw_and_decoded"
+        type: choice
+        options:
+          - raw_and_decoded
+          - raw_only
+      commit_changes:
+        description: "Commit extracted files & open-source docs to repository"
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches: [ main, master ]
+    paths:
+      - "**.apk"
+      - ".github/workflows/open-source-extract.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  extract-and-opensource:
+    name: Extract APK & Initialize Open-Source Repo
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install apktool (for decoded mode)
+        if: ${{ (inputs.extract_mode || 'raw_and_decoded') == 'raw_and_decoded' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apktool
+
+      - name: Extract every byte & file from APK(s)
+        run: |
+          shopt -s nullglob globstar
+          apks=( *.apk **/*.apk )
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "No APK files found in repository."
+            exit 0
+          fi
+
+          mkdir -p app-extracted
+          AAPT2=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name "aapt2" 2>/dev/null | sort -V | tail -n 1 || true)
+
+          for apk in "${apks[@]}"; do
+            base_name=$(basename "$apk" .apk)
+            target_dir="app-extracted/${base_name}"
+            mkdir -p "${target_dir}/raw"
+
+            echo "Extracting raw bytes/files from $apk..."
+            unzip -q -o "$apk" -d "${target_dir}/raw"
+
+            # Record exact byte-level SHA-256 manifest for every extracted file
+            (cd "${target_dir}/raw" && find . -type f | sort | xargs sha256sum > ../SHA256SUMS_RAW.txt)
+            sha256sum "$apk" > "${target_dir}/SHA256SUM_APK.txt"
+
+            if [ -n "$AAPT2" ]; then
+              "$AAPT2" dump badging "$apk" > "${target_dir}/APK_METADATA.txt" 2>/dev/null || true
+            fi
+
+            if [ "${{ inputs.extract_mode || 'raw_and_decoded' }}" = "raw_and_decoded" ]; then
+              echo "Decoding resources & manifest with apktool..."
+              apktool d -f "$apk" -o "${target_dir}/decoded" || echo "::warning::apktool decode had warnings for $apk"
+            fi
+          done
+
+      - name: Generate Open-Source community files
+        run: |
+          if [ ! -f LICENSE ]; then
+            cat <<'EOF' > LICENSE
+          MIT License
+
+          Copyright (c) 2026 ${{ github.repository_owner }}
+
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+          SOFTWARE.
+          EOF
+          fi
+
+          if [ ! -f .gitignore ]; then
+            cat <<'EOF' > .gitignore
+          *.jks
+          *.keystore
+          signing.properties
+          key.properties
+          .DS_Store
+          Thumbs.db
+          .idea/
+          *.iml
+          EOF
+          fi
+
+          if [ ! -f CONTRIBUTING.md ]; then
+            cat <<'EOF' > CONTRIBUTING.md
+          # دليل المساهمة (Contributing)
+
+          نرحب بمساهماتكم في هذا المشروع مفتوح المصدر!
+
+          1. قم بعمل **Fork** للمستودع.
+          2. أنشئ فرعاً جديداً: `git checkout -b feat/my-change`
+          3. ادفع تغييراتك وافتح **Pull Request**.
+          4. تأكد من عدم رفع أي مفاتيح توقيع خاصة (`*.jks`, `*.keystore`).
+          EOF
+          fi
+
+          if [ ! -f CODE_OF_CONDUCT.md ]; then
+            cat <<'EOF' > CODE_OF_CONDUCT.md
+          # مدونة السلوك (Code of Conduct)
+
+          نلتزم بتوفير بيئة محترمة ومرحبة وبنّاءة لجميع المساهمين والمستخدمين دون أي مضايقات.
+          EOF
+          fi
+
+          if [ ! -f SECURITY.md ]; then
+            cat <<'EOF' > SECURITY.md
+          # سياسة الأمان (Security Policy)
+
+          للإبلاغ عن أي ثغرة أمنية، يرجى استخدام تبويب **Security -> Advisories** في GitHub بدلاً من فتح Issue عام.
+          EOF
+          fi
+
+          if [ ! -f README.md ]; then
+            cat <<'EOF' > README.md
+          # ${{ github.event.repository.name }}
+
+          [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+          مستودع مفتوح المصدر يقوم تلقائياً باستخراج كامل محتويات ملفات الـ APK (بايت ببايت والموارد المفككة) وتهيئة بنية المشروع مفتوح المصدر عبر GitHub Actions.
+
+          ## البنية الناتجة
+          - `app-extracted/<apk-name>/raw/` — الاستخراج الكامل لكل ملف وبايت داخل حزمة الـ APK.
+          - `app-extracted/<apk-name>/decoded/` — الموارد وملف `AndroidManifest.xml` والـ smali بعد فكها عبر `apktool`.
+          - `app-extracted/<apk-name>/SHA256SUMS_RAW.txt` — بصمة SHA-256 لكل ملف مستخرج.
+          - `LICENSE`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` — ملفات الحوكمة مفتوحة المصدر.
+          EOF
+          fi
+
+      - name: Upload extracted APK contents as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-apk-and-opensource
+          path: |
+            app-extracted/
+            README.md
+            LICENSE
+            CONTRIBUTING.md
+            CODE_OF_CONDUCT.md
+            SECURITY.md
+          if-no-files-found: warn
+
+      - name: Commit & push extracted files and open-source docs
+        if: ${{ inputs.commit_changes != false }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app-extracted/ LICENSE README.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md .gitignore
+          if git diff --staged --quiet; then
+            echo "No new changes to commit."
+          else
+            git commit -m "chore: extract APK contents and initialize open-source files [skip ci]"
+            git push
+          fi
