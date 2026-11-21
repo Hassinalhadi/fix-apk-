@@ -1,11 +1,11 @@
-name: Patch and Sign LocatrGo1 APK
+name: Build LocateGO2 APK with HTTP Log Capture
 
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
     paths:
-      - 'LocatrGo1.apk'
+      - 'LocateGO2.apk'
       - '.github/workflows/patch-apk.yml'
 
 jobs:
@@ -15,117 +15,340 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Patch libstub.so inside LocatrGo1.apk
+      - name: Download Latest Apktool
         run: |
-          python3 - <<'EOF'
-          import os
-          import zipfile
+          APKTOOL_VER=$(curl -s https://api.github.com/repos/iBotPeaches/Apktool/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          echo "Downloading apktool v${APKTOOL_VER}..."
+          curl -sSL -o apktool.jar "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VER}/apktool_${APKTOOL_VER}.jar"
 
-          INPUT_APK = "LocatrGo1.apk"
-          UNALIGNED_APK = "LocatrGo1-unaligned.apk"
-          DOMAIN = "https://ammaralhadi.pythonanywhere.com"
+      - name: Decode LocateGO2.apk
+        run: |
+          java -jar apktool.jar d LocateGO2.apk -o decoded -f
 
-          REPLACEMENTS = [
-              (
-                  b"https://archerssmoothmograph.io/LocateGo.php?action=get_token&key=samurai_relay_2026_secret&android_id=",
-                  f"{DOMAIN}/gt.php?action=get_token&android_id=".encode(),
-              ),
-              (
-                  b"https://archerssmoothmograph.io/LocateGo.php?action=register_dna",
-                  f"{DOMAIN}/rd.php".encode(),
-              ),
-              (
-                  b"https://archerssmoothmograph.io/SmileMorden/server/broadcast_latest.php",
-                  f"{DOMAIN}/SmileMorden/server/bl.php".encode(),
-              ),
-              (
-                  b"https://archerssmoothmograph.io/SmileMorden/server/feature_verify.php",
-                  f"{DOMAIN}/SmileMorden/server/fv.php".encode(),
-              ),
-              (
-                  b"https://archerssmoothmograph.io/SmileMorden/server/member_sign.php",
-                  f"{DOMAIN}/SmileMorden/server/m.php".encode(),
-              ),
-              (
-                  b"https://archerssmoothmograph.io/SmileMorden/server/member_sign_0.php",
-                  f"{DOMAIN}/SmileMorden/server/m0.php".encode(),
-              ),
-              (
-                  b"https://archerssmoothmograph.io/SmileMorden/server/security_status.php",
-                  f"{DOMAIN}/SmileMorden/server/ss.php".encode(),
-              ),
-              (
-                  b"https://archerssmoothmograph.io/SmileMorden/server/trial_unregistered.php?action=status",
-                  f"{DOMAIN}/SmileMorden/server/tu.php?action=status".encode(),
-              ),
-              (
-                  b"https://archerssmoothmograph.io/SmileMorden/server/user_trial_status.php",
-                  f"{DOMAIN}/SmileMorden/server/ut.php".encode(),
-              ),
-          ]
+      - name: Compile HttpLogInterceptor to Smali
+        run: |
+          ANDROID_JAR=$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar | sort -V | tail -n 1)
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          echo "Using android.jar: $ANDROID_JAR"
+          echo "Using build-tools: $BUILD_TOOLS"
 
-          TARGET_SO = "lib/arm64-v8a/libstub.so"
+          mkdir -p log_src/okhttp3 log_src/okio log_src/com/locatego/log log_classes log_dex log_smali
 
-          with zipfile.ZipFile(INPUT_APK, "r") as zin, zipfile.ZipFile(UNALIGNED_APK, "w") as zout:
-              for item in zin.infolist():
-                  # Remove old APK v1 signature files before re-signing
-                  if item.filename.startswith("META-INF/") and item.filename.endswith((".SF", ".RSA", ".DSA", ".EC", "MANIFEST.MF")):
-                      continue
-
-                  data = zin.read(item.filename)
-                  if item.filename == TARGET_SO:
-                      orig_len = len(data)
-                      for old, new in REPLACEMENTS:
-                          assert len(new) <= len(old), f"Replacement too long: {new} > {old}"
-                          count = data.count(old)
-                          assert count == 1, f"Expected 1 occurrence of {old!r}, found {count}"
-                          padded = new + b"\x00" * (len(old) - len(new))
-                          data = data.replace(old, padded)
-                          print(f"Patched ({len(old)} -> {len(new)}): {new.decode()}")
-
-                      assert len(data) == orig_len, "libstub.so size changed!"
-                      assert b"archerssmoothmograph.io" not in data, "Old domain still present!"
-
-                  new_info = zipfile.ZipInfo(item.filename, date_time=item.date_time)
-                  new_info.compress_type = item.compress_type
-                  new_info.external_attr = item.external_attr
-                  zout.writestr(new_info, data)
-
-          print("Successfully created", UNALIGNED_APK)
+          # Minimal compile-time stubs matching LocateGO2's OkHttp3 & Okio signatures
+          cat <<'EOF' > log_src/okio/Buffer.java
+          package okio;
+          public class Buffer {
+              public Buffer() {}
+              public long size() { return 0; }
+              public String readUtf8() { return ""; }
+          }
           EOF
 
-      - name: Zipalign and Sign APK
+          cat <<'EOF' > log_src/okhttp3/Headers.java
+          package okhttp3;
+          public class Headers {
+              public String toString() { return ""; }
+          }
+          EOF
+
+          cat <<'EOF' > log_src/okhttp3/RequestBody.java
+          package okhttp3;
+          import java.io.IOException;
+          public abstract class RequestBody {
+              public void writeTo(Object sink) throws IOException {}
+          }
+          EOF
+
+          cat <<'EOF' > log_src/okhttp3/Request.java
+          package okhttp3;
+          public class Request {
+              public String method() { return ""; }
+              public Object url() { return null; }
+              public Headers headers() { return null; }
+              public RequestBody body() { return null; }
+          }
+          EOF
+
+          cat <<'EOF' > log_src/okhttp3/ResponseBody.java
+          package okhttp3;
+          import java.io.IOException;
+          public abstract class ResponseBody {
+              public String string() throws IOException { return ""; }
+          }
+          EOF
+
+          cat <<'EOF' > log_src/okhttp3/Response.java
+          package okhttp3;
+          import java.io.IOException;
+          public class Response {
+              public int code() { return 0; }
+              public String message() { return ""; }
+              public Request request() { return null; }
+              public Headers headers() { return null; }
+              public ResponseBody peekBody(long byteCount) throws IOException { return null; }
+          }
+          EOF
+
+          cat <<'EOF' > log_src/okhttp3/Interceptor.java
+          package okhttp3;
+          import java.io.IOException;
+          public interface Interceptor {
+              Response intercept(Chain chain) throws IOException;
+              interface Chain {
+                  Request request();
+                  Response proceed(Request request) throws IOException;
+              }
+          }
+          EOF
+
+          cat <<'EOF' > log_src/okhttp3/OkHttpClient.java
+          package okhttp3;
+          import java.util.List;
+          public class OkHttpClient {
+              public static class Builder {
+                  public List<Interceptor> interceptors() { return null; }
+                  public Builder addInterceptor(Interceptor interceptor) { return this; }
+              }
+          }
+          EOF
+
+          # Real HttpLogInterceptor implementation
+          cat <<'EOF' > log_src/com/locatego/log/HttpLogInterceptor.java
+          package com.locatego.log;
+
+          import android.app.Application;
+          import android.util.Log;
+          import java.io.File;
+          import java.io.FileWriter;
+          import java.io.IOException;
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+          import okhttp3.Interceptor;
+          import okhttp3.OkHttpClient;
+          import okhttp3.Request;
+          import okhttp3.RequestBody;
+          import okhttp3.Response;
+          import okhttp3.ResponseBody;
+          import okio.Buffer;
+
+          public class HttpLogInterceptor implements Interceptor {
+              private static final String TAG = "LocateGoLog";
+
+              public static void attach(OkHttpClient.Builder builder) {
+                  try {
+                      if (builder == null) return;
+                      for (Interceptor i : builder.interceptors()) {
+                          if (i instanceof HttpLogInterceptor) return;
+                      }
+                      builder.addInterceptor(new HttpLogInterceptor());
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              @Override
+              public Response intercept(Chain chain) throws IOException {
+                  Request req = chain.request();
+                  StringBuilder sb = new StringBuilder();
+                  String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(new Date());
+                  sb.append("\n================ HTTP LOG [").append(ts).append("] ================\n");
+
+                  try {
+                      sb.append(">>> ").append(req.method()).append(" ").append(String.valueOf(req.url())).append("\n");
+                      if (req.headers() != null) {
+                          sb.append(">>> HEADERS:\n").append(req.headers().toString());
+                      }
+                      RequestBody reqBody = req.body();
+                      if (reqBody != null) {
+                          try {
+                              Buffer buf = new Buffer();
+                              reqBody.writeTo(buf);
+                              String bodyStr = buf.readUtf8();
+                              if (bodyStr.length() > 8192) {
+                                  bodyStr = bodyStr.substring(0, 8192) + "...[TRUNCATED]";
+                              }
+                              sb.append(">>> REQ BODY:\n").append(bodyStr).append("\n");
+                          } catch (Throwable t) {
+                              sb.append(">>> REQ BODY: [unreadable: ").append(t.getMessage()).append("]\n");
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                  }
+
+                  Response resp;
+                  try {
+                      resp = chain.proceed(req);
+                  } catch (IOException e) {
+                      sb.append("<<< NETWORK ERROR: ").append(e.toString()).append("\n");
+                      writeLog(sb.toString());
+                      throw e;
+                  }
+
+                  try {
+                      int code = resp.code();
+                      if (code >= 400) {
+                          sb.append("!!! HTTP ERROR ").append(code).append(" !!!\n");
+                      }
+                      sb.append("<<< ").append(code).append(" ").append(resp.message())
+                        .append(" | ").append(String.valueOf(resp.request().url())).append("\n");
+                      if (resp.headers() != null) {
+                          sb.append("<<< RESP HEADERS:\n").append(resp.headers().toString());
+                      }
+                      try {
+                          ResponseBody peek = resp.peekBody(65536L);
+                          if (peek != null) {
+                              sb.append("<<< RESP BODY:\n").append(peek.string()).append("\n");
+                          }
+                      } catch (Throwable t) {
+                          sb.append("<<< RESP BODY: [unreadable: ").append(t.getMessage()).append("]\n");
+                      }
+                  } catch (Throwable ignored) {
+                  }
+
+                  sb.append("==============================================================\n");
+                  writeLog(sb.toString());
+                  return resp;
+              }
+
+              private static synchronized void writeLog(String text) {
+                  try {
+                      int len = text.length();
+                      for (int i = 0; i < len; i += 3500) {
+                          Log.e(TAG, text.substring(i, Math.min(len, i + 3500)));
+                      }
+                  } catch (Throwable ignored) {
+                  }
+
+                  try {
+                      Class<?> atClass = Class.forName("android.app.ActivityThread");
+                      Application app = (Application) atClass.getMethod("currentApplication").invoke(null);
+                      if (app != null) {
+                          File dir = app.getExternalFilesDir(null);
+                          if (dir != null) {
+                              if (!dir.exists()) dir.mkdirs();
+                              File logFile = new File(dir, "http_log.txt");
+                              FileWriter fw = new FileWriter(logFile, true);
+                              fw.write(text);
+                              fw.flush();
+                              fw.close();
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                  }
+              }
+          }
+          EOF
+
+          javac -source 1.8 -target 1.8 -cp "$ANDROID_JAR" -d log_classes \
+            log_src/okio/*.java log_src/okhttp3/*.java log_src/com/locatego/log/*.java
+
+          "$BUILD_TOOLS/d8" --output log_dex log_classes/com/locatego/log/*.class
+
+          if java -cp apktool.jar com.android.tools.smali.baksmali.Main --help >/dev/null 2>&1; then
+            java -cp apktool.jar com.android.tools.smali.baksmali.Main d log_dex/classes.dex -o log_smali
+          else
+            java -cp apktool.jar org.jf.baksmali.Main d log_dex/classes.dex -o log_smali
+          fi
+
+          mkdir -p decoded/smali/com/locatego/log
+          cp -r log_smali/com/locatego/log/* decoded/smali/com/locatego/log/
+
+      - name: Hook OkHttpClient$Builder and Enable Network Logging Config
         run: |
+          python3 - <<'EOF'
+          import glob
+          import os
+          import re
+          import xml.etree.ElementTree as ET
+
+          # 1. Hook okhttp3/OkHttpClient$Builder.build()
+          builder_files = glob.glob("decoded/smali*/okhttp3/OkHttpClient$Builder.smali")
+          assert len(builder_files) >= 1, f"OkHttpClient$Builder.smali not found! Found: {builder_files}"
+
+          for path in builder_files:
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+
+              pattern = re.compile(
+                  r'(\.method\s+(?:public\s+)?(?:final\s+)?build\(\)Lokhttp3/OkHttpClient;\s*\n'
+                  r'(?:\s*\.(?:locals|registers)\s+\d+\s*\n))',
+                  re.MULTILINE
+              )
+              hook = "    invoke-static {p0}, Lcom/locatego/log/HttpLogInterceptor;->attach(Lokhttp3/OkHttpClient$Builder;)V\n\n"
+              new_content, count = pattern.subn(r'\1' + hook, content, count=1)
+              assert count == 1, f"Failed to hook build() in {path}"
+
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(new_content)
+              print(f"Hooked OkHttpClient$Builder.build() in {path}")
+
+          # 2. Add network_security_config.xml to trust user CA certs (for Reqable / HTTP Toolkit)
+          os.makedirs("decoded/res/xml", exist_ok=True)
+          nsc_path = "decoded/res/xml/network_security_config.xml"
+          with open(nsc_path, "w", encoding="utf-8") as f:
+              f.write(
+                  '<?xml version="1.0" encoding="utf-8"?>\n'
+                  '<network-security-config>\n'
+                  '    <base-config cleartextTrafficPermitted="true">\n'
+                  '        <trust-anchors>\n'
+                  '            <certificates src="system" />\n'
+                  '            <certificates src="user" />\n'
+                  '        </trust-anchors>\n'
+                  '    </base-config>\n'
+                  '</network-security-config>\n'
+              )
+          print(f"Created {nsc_path}")
+
+          # 3. Update AndroidManifest.xml (debuggable + networkSecurityConfig)
+          manifest_path = "decoded/AndroidManifest.xml"
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          tree = ET.parse(manifest_path)
+          root = tree.getroot()
+          app = root.find("application")
+          assert app is not None, "<application> tag not found in AndroidManifest.xml"
+
+          ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
+          app.set(f"{ANDROID_NS}debuggable", "true")
+          app.set(f"{ANDROID_NS}networkSecurityConfig", "@xml/network_security_config")
+          app.set(f"{ANDROID_NS}usesCleartextTraffic", "true")
+          tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
+          print("Updated AndroidManifest.xml")
+          EOF
+
+      - name: Rebuild, Zipalign and Sign APK
+        run: |
+          java -jar apktool.jar b decoded -o LocateGO2-unaligned.apk
+
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
           echo "Using build-tools: $BUILD_TOOLS"
 
-          "$BUILD_TOOLS/zipalign" -p -f 4 LocatrGo1-unaligned.apk LocatrGo1-fixed.apk
+          "$BUILD_TOOLS/zipalign" -p -f 4 LocateGO2-unaligned.apk LocateGO2-log.apk
 
           keytool -genkeypair -v \
             -keystore release-temp.jks \
-            -alias samurai \
+            -alias locatego \
             -keyalg RSA \
             -keysize 2048 \
             -validity 10000 \
             -storepass android123 \
             -keypass android123 \
-            -dname "CN=Samurai, OU=Dev, O=LocatrGo, L=Baghdad, S=Baghdad, C=IQ"
+            -dname "CN=LocateGoLog, OU=Dev, O=LocateGo, L=Baghdad, S=Baghdad, C=IQ"
 
           "$BUILD_TOOLS/apksigner" sign \
             --ks release-temp.jks \
-            --ks-key-alias samurai \
+            --ks-key-alias locatego \
             --ks-pass pass:android123 \
             --key-pass pass:android123 \
             --v1-signing-enabled true \
             --v2-signing-enabled true \
             --v3-signing-enabled true \
-            LocatrGo1-fixed.apk
+            LocateGO2-log.apk
 
-          "$BUILD_TOOLS/apksigner" verify --verbose LocatrGo1-fixed.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose LocateGO2-log.apk
 
-      - name: Upload Fixed APK Artifact
+      - name: Upload LocateGO2-log APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LocatrGo1-fixed
-          path: LocatrGo1-fixed.apk
+          name: LocateGO2-log
+          path: LocateGO2-log.apk
           retention-days: 30
