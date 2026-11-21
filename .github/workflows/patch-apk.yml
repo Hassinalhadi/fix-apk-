@@ -1,0 +1,131 @@
+name: Patch and Sign LocatrGo1 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'LocatrGo1.apk'
+      - '.github/workflows/patch-apk.yml'
+
+jobs:
+  patch-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Patch libstub.so inside LocatrGo1.apk
+        run: |
+          python3 - <<'EOF'
+          import os
+          import zipfile
+
+          INPUT_APK = "LocatrGo1.apk"
+          UNALIGNED_APK = "LocatrGo1-unaligned.apk"
+          DOMAIN = "https://ammaralhadi.pythonanywhere.com"
+
+          REPLACEMENTS = [
+              (
+                  b"https://archerssmoothmograph.io/LocateGo.php?action=get_token&key=samurai_relay_2026_secret&android_id=",
+                  f"{DOMAIN}/gt.php?action=get_token&android_id=".encode(),
+              ),
+              (
+                  b"https://archerssmoothmograph.io/LocateGo.php?action=register_dna",
+                  f"{DOMAIN}/rd.php".encode(),
+              ),
+              (
+                  b"https://archerssmoothmograph.io/SmileMorden/server/broadcast_latest.php",
+                  f"{DOMAIN}/SmileMorden/server/bl.php".encode(),
+              ),
+              (
+                  b"https://archerssmoothmograph.io/SmileMorden/server/feature_verify.php",
+                  f"{DOMAIN}/SmileMorden/server/fv.php".encode(),
+              ),
+              (
+                  b"https://archerssmoothmograph.io/SmileMorden/server/member_sign.php",
+                  f"{DOMAIN}/SmileMorden/server/m.php".encode(),
+              ),
+              (
+                  b"https://archerssmoothmograph.io/SmileMorden/server/member_sign_0.php",
+                  f"{DOMAIN}/SmileMorden/server/m0.php".encode(),
+              ),
+              (
+                  b"https://archerssmoothmograph.io/SmileMorden/server/security_status.php",
+                  f"{DOMAIN}/SmileMorden/server/ss.php".encode(),
+              ),
+              (
+                  b"https://archerssmoothmograph.io/SmileMorden/server/trial_unregistered.php?action=status",
+                  f"{DOMAIN}/SmileMorden/server/tu.php?action=status".encode(),
+              ),
+              (
+                  b"https://archerssmoothmograph.io/SmileMorden/server/user_trial_status.php",
+                  f"{DOMAIN}/SmileMorden/server/ut.php".encode(),
+              ),
+          ]
+
+          TARGET_SO = "lib/arm64-v8a/libstub.so"
+
+          with zipfile.ZipFile(INPUT_APK, "r") as zin, zipfile.ZipFile(UNALIGNED_APK, "w") as zout:
+              for item in zin.infolist():
+                  # Remove old APK v1 signature files before re-signing
+                  if item.filename.startswith("META-INF/") and item.filename.endswith((".SF", ".RSA", ".DSA", ".EC", "MANIFEST.MF")):
+                      continue
+
+                  data = zin.read(item.filename)
+                  if item.filename == TARGET_SO:
+                      orig_len = len(data)
+                      for old, new in REPLACEMENTS:
+                          assert len(new) <= len(old), f"Replacement too long: {new} > {old}"
+                          count = data.count(old)
+                          assert count == 1, f"Expected 1 occurrence of {old!r}, found {count}"
+                          padded = new + b"\x00" * (len(old) - len(new))
+                          data = data.replace(old, padded)
+                          print(f"Patched ({len(old)} -> {len(new)}): {new.decode()}")
+
+                      assert len(data) == orig_len, "libstub.so size changed!"
+                      assert b"archerssmoothmograph.io" not in data, "Old domain still present!"
+
+                  new_info = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+                  new_info.compress_type = item.compress_type
+                  new_info.external_attr = item.external_attr
+                  zout.writestr(new_info, data)
+
+          print("Successfully created", UNALIGNED_APK)
+          EOF
+
+      - name: Zipalign and Sign APK
+        run: |
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          echo "Using build-tools: $BUILD_TOOLS"
+
+          "$BUILD_TOOLS/zipalign" -p -f 4 LocatrGo1-unaligned.apk LocatrGo1-fixed.apk
+
+          keytool -genkeypair -v \
+            -keystore release-temp.jks \
+            -alias samurai \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass android123 \
+            -keypass android123 \
+            -dname "CN=Samurai, OU=Dev, O=LocatrGo, L=Baghdad, S=Baghdad, C=IQ"
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks release-temp.jks \
+            --ks-key-alias samurai \
+            --ks-pass pass:android123 \
+            --key-pass pass:android123 \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            LocatrGo1-fixed.apk
+
+          "$BUILD_TOOLS/apksigner" verify --verbose LocatrGo1-fixed.apk
+
+      - name: Upload Fixed APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocatrGo1-fixed
+          path: LocatrGo1-fixed.apk
+          retention-days: 30
