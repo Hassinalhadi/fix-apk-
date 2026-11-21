@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       extract_mode:
-        description: "Extraction mode (raw bytes + decoded resources, or raw bytes only)"
+        description: "Extraction mode"
         required: true
-        default: "raw_and_decoded"
+        default: "full_source_and_raw"
         type: choice
         options:
+          - full_source_and_raw
           - raw_and_decoded
           - raw_only
       commit_changes:
@@ -29,7 +30,7 @@ jobs:
   extract-and-opensource:
     name: Extract APK & Initialize Open-Source Repo
     runs-on: ubuntu-latest
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]')
 
     steps:
       - name: Checkout repository
@@ -37,13 +38,25 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install apktool (for decoded mode)
-        if: ${{ (inputs.extract_mode || 'raw_and_decoded') == 'raw_and_decoded' }}
+      - name: Install apktool & jadx
+        if: ${{ (inputs.extract_mode || 'full_source_and_raw') != 'raw_only' }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq apktool
+          sudo apt-get install -y -qq apktool jq unzip
 
-      - name: Extract every byte & file from APK(s)
+          if [ "${{ inputs.extract_mode || 'full_source_and_raw' }}" = "full_source_and_raw" ]; then
+            JADX_URL=$(curl -s https://api.github.com/repos/skylot/jadx/releases/latest | jq -r '.assets[] | select(.name | test("^jadx-[0-9].*\\.zip$")) | .browser_download_url' | head -n 1)
+            if [ -n "$JADX_URL" ] && [ "$JADX_URL" != "null" ]; then
+              curl -sL "$JADX_URL" -o /tmp/jadx.zip
+              sudo unzip -q -o /tmp/jadx.zip -d /opt/jadx
+              sudo chmod +x /opt/jadx/bin/jadx
+              sudo ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx
+            else
+              echo "::warning::Could not download jadx; skipping Java decompilation."
+            fi
+          fi
+
+      - name: Extract every byte, resources & source from APK(s)
         run: |
           shopt -s nullglob globstar
           apks=( *.apk **/*.apk )
@@ -54,6 +67,7 @@ jobs:
 
           mkdir -p app-extracted
           AAPT2=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name "aapt2" 2>/dev/null | sort -V | tail -n 1 || true)
+          MODE="${{ inputs.extract_mode || 'full_source_and_raw' }}"
 
           for apk in "${apks[@]}"; do
             base_name=$(basename "$apk" .apk)
@@ -63,22 +77,29 @@ jobs:
             echo "Extracting raw bytes/files from $apk..."
             unzip -q -o "$apk" -d "${target_dir}/raw"
 
-            # Record exact byte-level SHA-256 manifest for every extracted file
-            (cd "${target_dir}/raw" && find . -type f | sort | xargs sha256sum > ../SHA256SUMS_RAW.txt)
+            # Record exact byte-level SHA-256 manifest (handles filenames with spaces safely)
+            (cd "${target_dir}/raw" && find . -type f -print0 | sort -z | xargs -0 sha256sum > ../SHA256SUMS_RAW.txt)
             sha256sum "$apk" > "${target_dir}/SHA256SUM_APK.txt"
 
             if [ -n "$AAPT2" ]; then
               "$AAPT2" dump badging "$apk" > "${target_dir}/APK_METADATA.txt" 2>/dev/null || true
             fi
 
-            if [ "${{ inputs.extract_mode || 'raw_and_decoded' }}" = "raw_and_decoded" ]; then
+            if [ "$MODE" = "raw_and_decoded" ] || [ "$MODE" = "full_source_and_raw" ]; then
               echo "Decoding resources & manifest with apktool..."
               apktool d -f "$apk" -o "${target_dir}/decoded" || echo "::warning::apktool decode had warnings for $apk"
             fi
+
+            if [ "$MODE" = "full_source_and_raw" ] && command -v jadx >/dev/null 2>&1; then
+              echo "Decompiling DEX bytecode to Java source with jadx..."
+              jadx --show-bad-code -d "${target_dir}/src" "$apk" || echo "::warning::jadx finished with warnings for $apk"
+            fi
           done
 
-      - name: Generate Open-Source community files
+      - name: Generate Open-Source community & governance files
         run: |
+          mkdir -p .github/ISSUE_TEMPLATE
+
           if [ ! -f LICENSE ]; then
             cat <<'EOF' > LICENSE
           MIT License
@@ -147,19 +168,78 @@ jobs:
           EOF
           fi
 
+          if [ ! -f .github/ISSUE_TEMPLATE/bug_report.md ]; then
+            cat <<'EOF' > .github/ISSUE_TEMPLATE/bug_report.md
+          ---
+          name: Bug Report (الإبلاغ عن خطأ)
+          about: أبلغ عن مشكلة للمساعدة في تحسين المشروع
+          title: "[Bug]: "
+          labels: bug
+          ---
+
+          ## وصف المشكلة
+          وصف واضح ومختصر للخطأ.
+
+          ## خطوات إعادة الإنتاج
+          1. ...
+          2. ...
+
+          ## السلوك المتوقع
+          ما الذي كان يفترض أن يحدث؟
+          EOF
+          fi
+
+          if [ ! -f .github/ISSUE_TEMPLATE/feature_request.md ]; then
+            cat <<'EOF' > .github/ISSUE_TEMPLATE/feature_request.md
+          ---
+          name: Feature Request (اقتراح ميزة)
+          about: اقترح فكرة أو تحسيناً جديداً للمشروع
+          title: "[Feature]: "
+          labels: enhancement
+          ---
+
+          ## الميزة المقترحة
+          اشرح الميزة المطلوبة وسبب أهميتها.
+          EOF
+          fi
+
+          if [ ! -f .github/PULL_REQUEST_TEMPLATE.md ]; then
+            cat <<'EOF' > .github/PULL_REQUEST_TEMPLATE.md
+          ## ملخص التغييرات
+          - اشرح ما تم تعديله أو إضافته.
+
+          ## قائمة التحقق
+          - [ ] تم اختبار التغييرات محلياً.
+          - [ ] لا توجد مفاتيح توقيع أو ملفات حساسة مرفوعة.
+          EOF
+          fi
+
+          if [ ! -f .github/dependabot.yml ]; then
+            cat <<'EOF' > .github/dependabot.yml
+          version: 2
+          updates:
+            - package-ecosystem: "github-actions"
+              directory: "/"
+              schedule:
+                interval: "weekly"
+          EOF
+          fi
+
           if [ ! -f README.md ]; then
             cat <<'EOF' > README.md
           # ${{ github.event.repository.name }}
 
           [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-          مستودع مفتوح المصدر يقوم تلقائياً باستخراج كامل محتويات ملفات الـ APK (بايت ببايت والموارد المفككة) وتهيئة بنية المشروع مفتوح المصدر عبر GitHub Actions.
+          مستودع مفتوح المصدر يقوم تلقائياً باستخراج كامل محتويات ملفات الـ APK (المصدر المفكك، الموارد، والبايتات الخام) وتهيئة بنية المشروع مفتوح المصدر عبر GitHub Actions.
 
           ## البنية الناتجة
+          - `app-extracted/<apk-name>/src/` — الشيفرة المصدرية المستخرجة عبر `jadx`.
+          - `app-extracted/<apk-name>/decoded/` — الموارد وملف `AndroidManifest.xml` والـ smali عبر `apktool`.
           - `app-extracted/<apk-name>/raw/` — الاستخراج الكامل لكل ملف وبايت داخل حزمة الـ APK.
-          - `app-extracted/<apk-name>/decoded/` — الموارد وملف `AndroidManifest.xml` والـ smali بعد فكها عبر `apktool`.
           - `app-extracted/<apk-name>/SHA256SUMS_RAW.txt` — بصمة SHA-256 لكل ملف مستخرج.
           - `LICENSE`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` — ملفات الحوكمة مفتوحة المصدر.
+          - `.github/` — قوالب البلاغات وطلبات الدمج وتحديثات Dependabot.
           EOF
           fi
 
@@ -174,6 +254,7 @@ jobs:
             CONTRIBUTING.md
             CODE_OF_CONDUCT.md
             SECURITY.md
+            .github/
           if-no-files-found: warn
 
       - name: Commit & push extracted files and open-source docs
@@ -181,7 +262,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add app-extracted/ LICENSE README.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md .gitignore
+          git add app-extracted/ LICENSE README.md CONTRIBUTING.md CODE_OF_CONDUCT.md SECURITY.md .gitignore .github/
           if git diff --staged --quiet; then
             echo "No new changes to commit."
           else
