@@ -1,4 +1,4 @@
-name: Build LocateGO2 APK with HTTP Log Capture
+name: Build LocateGO2 APK with Floating HTTP Log Capture
 
 on:
   workflow_dispatch:
@@ -25,7 +25,7 @@ jobs:
         run: |
           java -jar apktool.jar d LocateGO2.apk -o decoded -f
 
-      - name: Compile HttpLogInterceptor to DEX
+      - name: Compile Floating HTTP Log Interceptor to DEX
         run: |
           ANDROID_JAR=$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar | sort -V | tail -n 1)
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
@@ -125,7 +125,266 @@ jobs:
           }
           EOF
 
-          # Real HttpLogInterceptor implementation
+          # Floating Button + In-App Log Viewer Overlay (no SYSTEM_ALERT_WINDOW permission needed)
+          cat <<'EOF' > log_src/com/locatego/log/FloatingLogOverlay.java
+          package com.locatego.log;
+
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.Application;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.DisplayMetrics;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.lang.ref.WeakReference;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class FloatingLogOverlay implements Application.ActivityLifecycleCallbacks {
+              private static final String TAG_BTN = "locatego_floating_log_btn";
+              private static final int MAX_ENTRIES = 120;
+              private static volatile boolean initialized = false;
+              private static final List<String> entries = new ArrayList<>();
+              private static volatile int errorCount = 0;
+              private static final Handler mainHandler = new Handler(Looper.getMainLooper());
+              private static WeakReference<Activity> currentActivityRef = new WeakReference<>(null);
+              private static float lastX = -1f;
+              private static float lastY = -1f;
+
+              public static synchronized void ensureInitialized() {
+                  if (initialized) return;
+                  try {
+                      Class<?> atClass = Class.forName("android.app.ActivityThread");
+                      Application app = (Application) atClass.getMethod("currentApplication").invoke(null);
+                      if (app != null) {
+                          app.registerActivityLifecycleCallbacks(new FloatingLogOverlay());
+                          initialized = true;
+                      }
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              public static synchronized void addEntry(String entry, boolean isError) {
+                  if (entries.size() >= MAX_ENTRIES) {
+                      entries.remove(0);
+                  }
+                  entries.add(entry);
+                  if (isError) {
+                      errorCount++;
+                  }
+                  mainHandler.post(FloatingLogOverlay::refreshBadge);
+              }
+
+              public static synchronized String getAllLogs() {
+                  StringBuilder sb = new StringBuilder();
+                  for (int i = entries.size() - 1; i >= 0; i--) {
+                      sb.append(entries.get(i)).append("\n");
+                  }
+                  return sb.length() == 0 ? "لا توجد سجلات HTTP بعد." : sb.toString();
+              }
+
+              public static synchronized void clearLogs() {
+                  entries.clear();
+                  errorCount = 0;
+                  mainHandler.post(FloatingLogOverlay::refreshBadge);
+              }
+
+              private static int dp(Context ctx, int val) {
+                  return Math.round(val * ctx.getResources().getDisplayMetrics().density);
+              }
+
+              private static void refreshBadge() {
+                  Activity act = currentActivityRef.get();
+                  if (act == null || act.isFinishing()) return;
+                  View root = act.getWindow() != null ? act.getWindow().getDecorView() : null;
+                  if (!(root instanceof ViewGroup)) return;
+                  View v = root.findViewWithTag(TAG_BTN);
+                  if (v instanceof TextView) {
+                      TextView tv = (TextView) v;
+                      int total;
+                      int errs;
+                      synchronized (FloatingLogOverlay.class) {
+                          total = entries.size();
+                          errs = errorCount;
+                      }
+                      tv.setText(errs > 0 ? ("LOG " + errs + "!") : ("LOG " + total));
+                      GradientDrawable bg = new GradientDrawable();
+                      bg.setShape(GradientDrawable.RECTANGLE);
+                      bg.setCornerRadius(dp(act, 22));
+                      bg.setColor(errs > 0 ? Color.parseColor("#D32F2F") : Color.parseColor("#1E293B"));
+                      bg.setStroke(dp(act, 1), Color.parseColor("#94A3B8"));
+                      tv.setBackground(bg);
+                  }
+              }
+
+              private static void attachToActivity(Activity act) {
+                  if (act == null || act.isFinishing()) return;
+                  View decor = act.getWindow() != null ? act.getWindow().getDecorView() : null;
+                  if (!(decor instanceof FrameLayout)) return;
+                  FrameLayout root = (FrameLayout) decor;
+                  if (root.findViewWithTag(TAG_BTN) != null) {
+                      refreshBadge();
+                      return;
+                  }
+
+                  TextView btn = new TextView(act);
+                  btn.setTag(TAG_BTN);
+                  btn.setTextColor(Color.WHITE);
+                  btn.setTextSize(11f);
+                  btn.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+                  btn.setGravity(Gravity.CENTER);
+                  int padH = dp(act, 10);
+                  int padV = dp(act, 8);
+                  btn.setPadding(padH, padV, padH, padV);
+                  btn.setElevation(dp(act, 10));
+
+                  DisplayMetrics dm = act.getResources().getDisplayMetrics();
+                  FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.WRAP_CONTENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT
+                  );
+                  lp.gravity = Gravity.TOP | Gravity.START;
+                  btn.setLayoutParams(lp);
+                  if (lastX < 0 || lastY < 0) {
+                      lastX = dm.widthPixels - dp(act, 86);
+                      lastY = dm.heightPixels * 0.28f;
+                  }
+                  btn.setX(lastX);
+                  btn.setY(lastY);
+
+                  btn.setOnTouchListener(new View.OnTouchListener() {
+                      private float downRawX, downRawY, startX, startY;
+                      private boolean moved;
+
+                      @Override
+                      public boolean onTouch(View v, MotionEvent event) {
+                          switch (event.getActionMasked()) {
+                              case MotionEvent.ACTION_DOWN:
+                                  downRawX = event.getRawX();
+                                  downRawY = event.getRawY();
+                                  startX = v.getX();
+                                  startY = v.getY();
+                                  moved = false;
+                                  return true;
+                              case MotionEvent.ACTION_MOVE:
+                                  float dx = event.getRawX() - downRawX;
+                                  float dy = event.getRawY() - downRawY;
+                                  if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+                                      moved = true;
+                                  }
+                                  lastX = Math.max(0, Math.min(dm.widthPixels - v.getWidth(), startX + dx));
+                                  lastY = Math.max(dp(act, 24), Math.min(dm.heightPixels - v.getHeight() - dp(act, 24), startY + dy));
+                                  v.setX(lastX);
+                                  v.setY(lastY);
+                                  return true;
+                              case MotionEvent.ACTION_UP:
+                                  if (!moved) {
+                                      showLogDialog(act);
+                                  }
+                                  return true;
+                          }
+                          return false;
+                      }
+                  });
+
+                  root.addView(btn);
+                  refreshBadge();
+              }
+
+              private static void showLogDialog(Activity act) {
+                  try {
+                      LinearLayout container = new LinearLayout(act);
+                      container.setOrientation(LinearLayout.VERTICAL);
+                      container.setPadding(dp(act, 12), dp(act, 12), dp(act, 12), dp(act, 8));
+                      container.setBackgroundColor(Color.parseColor("#0F172A"));
+
+                      ScrollView scroll = new ScrollView(act);
+                      LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                              ViewGroup.LayoutParams.MATCH_PARENT,
+                              Math.round(act.getResources().getDisplayMetrics().heightPixels * 0.55f)
+                      );
+                      scroll.setLayoutParams(slp);
+
+                      TextView logView = new TextView(act);
+                      logView.setText(getAllLogs());
+                      logView.setTextColor(Color.parseColor("#E2E8F0"));
+                      logView.setTextSize(11f);
+                      logView.setTypeface(Typeface.MONOSPACE);
+                      logView.setTextIsSelectable(true);
+                      scroll.addView(logView);
+                      container.addView(scroll);
+
+                      LinearLayout actions = new LinearLayout(act);
+                      actions.setOrientation(LinearLayout.HORIZONTAL);
+                      actions.setGravity(Gravity.END);
+                      actions.setPadding(0, dp(act, 8), 0, 0);
+
+                      AlertDialog dialog = new AlertDialog.Builder(act)
+                              .setTitle("LocateGO HTTP Log")
+                              .setView(container)
+                              .create();
+
+                      Button copyBtn = new Button(act);
+                      copyBtn.setText("نسخ");
+                      copyBtn.setOnClickListener(v -> {
+                          ClipboardManager cm = (ClipboardManager) act.getSystemService(Context.CLIPBOARD_SERVICE);
+                          if (cm != null) {
+                              cm.setPrimaryClip(ClipData.newPlainText("LocateGO_HTTP_Log", getAllLogs()));
+                              Toast.makeText(act, "تم نسخ السجل", Toast.LENGTH_SHORT).show();
+                          }
+                      });
+
+                      Button clearBtn = new Button(act);
+                      clearBtn.setText("مسح");
+                      clearBtn.setOnClickListener(v -> {
+                          clearLogs();
+                          HttpLogInterceptor.clearFileLog();
+                          logView.setText(getAllLogs());
+                      });
+
+                      Button closeBtn = new Button(act);
+                      closeBtn.setText("إغلاق");
+                      closeBtn.setOnClickListener(v -> dialog.dismiss());
+
+                      actions.addView(copyBtn);
+                      actions.addView(clearBtn);
+                      actions.addView(closeBtn);
+                      container.addView(actions);
+                      dialog.show();
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              @Override public void onActivityCreated(Activity activity, Bundle savedInstanceState) {}
+              @Override public void onActivityStarted(Activity activity) {}
+              @Override public void onActivityResumed(Activity activity) {
+                  currentActivityRef = new WeakReference<>(activity);
+                  mainHandler.post(() -> attachToActivity(activity));
+              }
+              @Override public void onActivityPaused(Activity activity) {}
+              @Override public void onActivityStopped(Activity activity) {}
+              @Override public void onActivitySaveInstanceState(Activity activity, Bundle outState) {}
+              @Override public void onActivityDestroyed(Activity activity) {}
+          }
+          EOF
+
+          # Real HttpLogInterceptor (captures both OkHttp3 & AutoBid HttpURLConnection)
           cat <<'EOF' > log_src/com/locatego/log/HttpLogInterceptor.java
           package com.locatego.log;
 
@@ -134,9 +393,12 @@ jobs:
           import java.io.File;
           import java.io.FileWriter;
           import java.io.IOException;
+          import java.lang.reflect.Field;
           import java.text.SimpleDateFormat;
           import java.util.Date;
+          import java.util.LinkedHashMap;
           import java.util.Locale;
+          import java.util.Map;
           import okhttp3.Interceptor;
           import okhttp3.OkHttpClient;
           import okhttp3.Request;
@@ -149,6 +411,7 @@ jobs:
               private static final String TAG = "LocateGoLog";
 
               public static void attach(OkHttpClient.Builder builder) {
+                  FloatingLogOverlay.ensureInitialized();
                   try {
                       if (builder == null) return;
                       for (Interceptor i : builder.interceptors()) {
@@ -159,17 +422,66 @@ jobs:
                   }
               }
 
+              public static void logAutoBidRequest(String method, String path, LinkedHashMap headers, String body) {
+                  FloatingLogOverlay.ensureInitialized();
+                  try {
+                      StringBuilder sb = new StringBuilder();
+                      String ts = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date());
+                      sb.append("\n[AutoBid REQ ").append(ts).append("] ").append(method).append(" ").append(path).append("\n");
+                      if (headers != null && !headers.isEmpty()) {
+                          sb.append("HEADERS: ");
+                          for (Object k : headers.keySet()) {
+                              sb.append(k).append("=").append(headers.get(k)).append("; ");
+                          }
+                          sb.append("\n");
+                      }
+                      if (body != null && !body.isEmpty()) {
+                          sb.append("REQ BODY: ").append(body).append("\n");
+                      }
+                      writeLog(sb.toString(), false);
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              public static void logAutoBidResponse(String method, String path, Object respObj) {
+                  FloatingLogOverlay.ensureInitialized();
+                  try {
+                      int code = -1;
+                      String body = "";
+                      if (respObj != null) {
+                          for (Field f : respObj.getClass().getDeclaredFields()) {
+                              f.setAccessible(true);
+                              if (f.getType() == int.class) {
+                                  code = f.getInt(respObj);
+                              } else if (f.getType() == String.class) {
+                                  Object val = f.get(respObj);
+                                  if (val != null) body = val.toString();
+                              }
+                          }
+                      }
+                      boolean isErr = code >= 400 || code < 0;
+                      String ts = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date());
+                      StringBuilder sb = new StringBuilder();
+                      if (isErr) sb.append("!!! HTTP ERROR ").append(code).append(" !!!\n");
+                      sb.append("[AutoBid RESP ").append(ts).append("] ").append(code).append(" | ").append(method).append(" ").append(path).append("\n");
+                      sb.append("RESP BODY: ").append(body).append("\n");
+                      sb.append("--------------------------------------------------------------\n");
+                      writeLog(sb.toString(), isErr);
+                  } catch (Throwable ignored) {
+                  }
+              }
+
               @Override
               public Response intercept(Chain chain) throws IOException {
+                  FloatingLogOverlay.ensureInitialized();
                   Request req = chain.request();
                   StringBuilder sb = new StringBuilder();
-                  String ts = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(new Date());
-                  sb.append("\n================ HTTP LOG [").append(ts).append("] ================\n");
+                  String ts = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(new Date());
+                  sb.append("\n[OkHttp ").append(ts).append("] ").append(req.method()).append(" ").append(String.valueOf(req.url())).append("\n");
 
                   try {
-                      sb.append(">>> ").append(req.method()).append(" ").append(String.valueOf(req.url())).append("\n");
                       if (req.headers() != null) {
-                          sb.append(">>> HEADERS:\n").append(req.headers().toString());
+                          sb.append("REQ HEADERS:\n").append(req.headers().toString());
                       }
                       RequestBody reqBody = req.body();
                       if (reqBody != null) {
@@ -177,12 +489,12 @@ jobs:
                               Buffer buf = new Buffer();
                               reqBody.writeTo(buf);
                               String bodyStr = buf.readUtf8();
-                              if (bodyStr.length() > 8192) {
-                                  bodyStr = bodyStr.substring(0, 8192) + "...[TRUNCATED]";
+                              if (bodyStr.length() > 4096) {
+                                  bodyStr = bodyStr.substring(0, 4096) + "...[TRUNCATED]";
                               }
-                              sb.append(">>> REQ BODY:\n").append(bodyStr).append("\n");
+                              sb.append("REQ BODY:\n").append(bodyStr).append("\n");
                           } catch (Throwable t) {
-                              sb.append(">>> REQ BODY: [unreadable: ").append(t.getMessage()).append("]\n");
+                              sb.append("REQ BODY: [unreadable: ").append(t.getMessage()).append("]\n");
                           }
                       }
                   } catch (Throwable ignored) {
@@ -192,38 +504,58 @@ jobs:
                   try {
                       resp = chain.proceed(req);
                   } catch (IOException e) {
-                      sb.append("<<< NETWORK ERROR: ").append(e.toString()).append("\n");
-                      writeLog(sb.toString());
+                      sb.append("NETWORK ERROR: ").append(e.toString()).append("\n");
+                      writeLog(sb.toString(), true);
                       throw e;
                   }
 
+                  boolean isErr = false;
                   try {
                       int code = resp.code();
-                      if (code >= 400) {
+                      isErr = code >= 400;
+                      if (isErr) {
                           sb.append("!!! HTTP ERROR ").append(code).append(" !!!\n");
                       }
                       sb.append("<<< ").append(code).append(" ").append(resp.message())
                         .append(" | ").append(String.valueOf(resp.request().url())).append("\n");
                       if (resp.headers() != null) {
-                          sb.append("<<< RESP HEADERS:\n").append(resp.headers().toString());
+                          sb.append("RESP HEADERS:\n").append(resp.headers().toString());
                       }
                       try {
                           ResponseBody peek = resp.peekBody(65536L);
                           if (peek != null) {
-                              sb.append("<<< RESP BODY:\n").append(peek.string()).append("\n");
+                              sb.append("RESP BODY:\n").append(peek.string()).append("\n");
                           }
                       } catch (Throwable t) {
-                          sb.append("<<< RESP BODY: [unreadable: ").append(t.getMessage()).append("]\n");
+                          sb.append("RESP BODY: [unreadable: ").append(t.getMessage()).append("]\n");
                       }
                   } catch (Throwable ignored) {
                   }
 
-                  sb.append("==============================================================\n");
-                  writeLog(sb.toString());
+                  sb.append("--------------------------------------------------------------\n");
+                  writeLog(sb.toString(), isErr);
                   return resp;
               }
 
-              private static synchronized void writeLog(String text) {
+              public static synchronized void clearFileLog() {
+                  try {
+                      Class<?> atClass = Class.forName("android.app.ActivityThread");
+                      Application app = (Application) atClass.getMethod("currentApplication").invoke(null);
+                      if (app != null) {
+                          File dir = app.getExternalFilesDir(null);
+                          if (dir != null) {
+                              File logFile = new File(dir, "http_log.txt");
+                              if (logFile.exists()) {
+                                  new FileWriter(logFile, false).close();
+                              }
+                          }
+                      }
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              private static synchronized void writeLog(String text, boolean isError) {
+                  FloatingLogOverlay.addEntry(text, isError);
                   try {
                       int len = text.length();
                       for (int i = 0; i < len; i += 3500) {
@@ -258,7 +590,7 @@ jobs:
           "$BUILD_TOOLS/d8" --classpath "$ANDROID_JAR" --classpath log_classes \
             --output log_dex log_classes/com/locatego/log/*.class
 
-      - name: Hook OkHttpClient$Builder and Enable Network Logging Config
+      - name: Hook OkHttpClient, AutoBid HTTP, and Network Config
         run: |
           python3 - <<'EOF'
           import glob
@@ -287,7 +619,31 @@ jobs:
                   f.write(new_content)
               print(f"Hooked OkHttpClient$Builder.build() in {path}")
 
-          # 2. Add network_security_config.xml to trust user CA certs (for Reqable / HTTP Toolkit)
+          # 2. Hook AutoBid HTTP client (La/z;->i) if present so 403 responses are captured
+          z_files = glob.glob("decoded/smali*/a/z.smali")
+          for zpath in z_files:
+              with open(zpath, "r", encoding="utf-8") as f:
+                  zcontent = f.read()
+              m_pat = re.compile(
+                  r'(\.method\s+[^\n]*\bi\(Ljava/lang/String;Ljava/lang/String;Ljava/util/LinkedHashMap;Ljava/lang/String;\)La/y;\s*\n'
+                  r'\s*\.(?:locals|registers)\s+\d+\s*\n)(.*?)(\n\.end method)',
+                  re.DOTALL
+              )
+              m = m_pat.search(zcontent)
+              if m:
+                  header, body, footer = m.group(1), m.group(2), m.group(3)
+                  req_hook = "    invoke-static {p1, p2, p3, p4}, Lcom/locatego/log/HttpLogInterceptor;->logAutoBidRequest(Ljava/lang/String;Ljava/lang/String;Ljava/util/LinkedHashMap;Ljava/lang/String;)V\n"
+                  body = re.sub(
+                      r'(\n\s*return-object\s+(v\d+|p\d+))',
+                      r'\n    invoke-static {p1, p2, \2}, Lcom/locatego/log/HttpLogInterceptor;->logAutoBidResponse(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)V\1',
+                      body
+                  )
+                  new_z = zcontent[:m.start()] + header + req_hook + body + footer + zcontent[m.end():]
+                  with open(zpath, "w", encoding="utf-8") as f:
+                      f.write(new_z)
+                  print(f"Hooked AutoBid HTTP in {zpath}")
+
+          # 3. Add network_security_config.xml to trust user CA certs (for Reqable / HTTP Toolkit)
           os.makedirs("decoded/res/xml", exist_ok=True)
           nsc_path = "decoded/res/xml/network_security_config.xml"
           with open(nsc_path, "w", encoding="utf-8") as f:
@@ -304,7 +660,7 @@ jobs:
               )
           print(f"Created {nsc_path}")
 
-          # 3. Update AndroidManifest.xml (debuggable + networkSecurityConfig)
+          # 4. Update AndroidManifest.xml (do NOT force debuggable=true to avoid Play Integrity debug flag)
           manifest_path = "decoded/AndroidManifest.xml"
           ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
           tree = ET.parse(manifest_path)
@@ -313,11 +669,11 @@ jobs:
           assert app is not None, "<application> tag not found in AndroidManifest.xml"
 
           ANDROID_NS = "{http://schemas.android.com/apk/res/android}"
-          app.set(f"{ANDROID_NS}debuggable", "true")
+          app.attrib.pop(f"{ANDROID_NS}debuggable", None)
           app.set(f"{ANDROID_NS}networkSecurityConfig", "@xml/network_security_config")
           app.set(f"{ANDROID_NS}usesCleartextTraffic", "true")
           tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
-          print("Updated AndroidManifest.xml")
+          print("Updated AndroidManifest.xml (without debuggable=true)")
           EOF
 
       - name: Rebuild, Inject Log DEX, Zipalign and Sign APK
@@ -335,7 +691,7 @@ jobs:
                       dex_nums.append(int(m.group(1) or 1))
               next_dex = f"classes{max(dex_nums) + 1}.dex"
               z.write("log_dex/classes.dex", next_dex)
-              print(f"Injected HttpLogInterceptor DEX as {next_dex}")
+              print(f"Injected Floating Log DEX as {next_dex}")
           EOF
 
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
