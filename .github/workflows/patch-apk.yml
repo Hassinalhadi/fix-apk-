@@ -590,7 +590,7 @@ jobs:
           "$BUILD_TOOLS/d8" --classpath "$ANDROID_JAR" --classpath log_classes \
             --output log_dex log_classes/com/locatego/log/*.class
 
-      - name: Hook OkHttpClient, AutoBid HTTP, and Network Config
+      - name: Hook OkHttpClient, AutoBid HTTP, Patch Accept 403, and Network Config
         run: |
           python3 - <<'EOF'
           import glob
@@ -619,11 +619,29 @@ jobs:
                   f.write(new_content)
               print(f"Hooked OkHttpClient$Builder.build() in {path}")
 
-          # 2. Hook AutoBid HTTP client (La/z;->i) if present so 403 responses are captured
+          # 2. Hook AutoBid HTTP client (La/z;->i), switch accept path to v3, and add User-Agent
           z_files = glob.glob("decoded/smali*/a/z.smali")
           for zpath in z_files:
               with open(zpath, "r", encoding="utf-8") as f:
                   zcontent = f.read()
+
+              # Switch /api/v2/orders/assign/ -> /api/v3/orders/assign/
+              if '"/api/v2/orders/assign/"' in zcontent:
+                  zcontent = zcontent.replace('"/api/v2/orders/assign/"', '"/api/v3/orders/assign/"')
+                  print(f"Updated accept endpoint to /api/v3/orders/assign/ in {zpath}")
+
+              # Add User-Agent header in La/z;->i
+              ua_target = '    const-string v0, "x-from-language"'
+              if ua_target in zcontent:
+                  ua_patch = (
+                      '    const-string v0, "User-Agent"\n'
+                      '    const-string v1, "okhttp/4.12.0"\n'
+                      '    invoke-virtual {v8, v0, v1}, Ljava/net/URLConnection;->setRequestProperty(Ljava/lang/String;Ljava/lang/String;)V\n\n'
+                      + ua_target
+                  )
+                  zcontent = zcontent.replace(ua_target, ua_patch, 1)
+                  print(f"Added User-Agent header in {zpath}")
+
               m_pat = re.compile(
                   r'(\.method\s+[^\n]*\bi\(Ljava/lang/String;Ljava/lang/String;Ljava/util/LinkedHashMap;Ljava/lang/String;\)La/y;\s*\n'
                   r'\s*\.(?:locals|registers)\s+\d+\s*\n)(.*?)(\n\.end method)',
@@ -638,12 +656,33 @@ jobs:
                       r'\n    invoke-static {p1, p2, \2}, Lcom/locatego/log/HttpLogInterceptor;->logAutoBidResponse(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;)V\1',
                       body
                   )
-                  new_z = zcontent[:m.start()] + header + req_hook + body + footer + zcontent[m.end():]
-                  with open(zpath, "w", encoding="utf-8") as f:
-                      f.write(new_z)
+                  zcontent = zcontent[:m.start()] + header + req_hook + body + footer + zcontent[m.end():]
                   print(f"Hooked AutoBid HTTP in {zpath}")
 
-          # 3. Add network_security_config.xml to trust user CA certs (for Reqable / HTTP Toolkit)
+              with open(zpath, "w", encoding="utf-8") as f:
+                  f.write(zcontent)
+
+          # 3. Allow HTTP 403 (0x193) in AutoBidService to retry instead of permanently blocking the order
+          abs_files = glob.glob("decoded/smali*/sa/lg/android/locate/autobid/AutoBidService.smali")
+          for spath in abs_files:
+              with open(spath, "r", encoding="utf-8") as f:
+                  scontent = f.read()
+              retry_pat = re.compile(
+                  r'(const/16\s+(v\d+),\s+0x198\s*\n'
+                  r'(?:\s*const/16\s+v\d+,\s+0x1f4\s*\n)?'
+                  r'\s*if-eq\s+(v\d+),\s+\2,\s+(:cond_\w+))'
+              )
+              scontent, n = retry_pat.subn(
+                  r'\1\n\n    const/16 \2, 0x193\n    if-eq \3, \2, \4',
+                  scontent,
+                  count=1
+              )
+              if n > 0:
+                  with open(spath, "w", encoding="utf-8") as f:
+                      f.write(scontent)
+                  print(f"Patched HTTP 403 retry handling in {spath}")
+
+          # 4. Add network_security_config.xml to trust user CA certs (for Reqable / HTTP Toolkit)
           os.makedirs("decoded/res/xml", exist_ok=True)
           nsc_path = "decoded/res/xml/network_security_config.xml"
           with open(nsc_path, "w", encoding="utf-8") as f:
@@ -660,7 +699,7 @@ jobs:
               )
           print(f"Created {nsc_path}")
 
-          # 4. Update AndroidManifest.xml (do NOT force debuggable=true to avoid Play Integrity debug flag)
+          # 5. Update AndroidManifest.xml (do NOT force debuggable=true to avoid Play Integrity debug flag)
           manifest_path = "decoded/AndroidManifest.xml"
           ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
           tree = ET.parse(manifest_path)
